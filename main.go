@@ -18,6 +18,7 @@ type PrepareResult int
 const (
 	PrepareSuccess PrepareResult = iota
 	PrepareUnrecognizedStatement
+	PrepareSyntaxError
 )
 
 type StatementType int
@@ -27,8 +28,15 @@ const (
 	StatementSelect
 )
 
+type Row struct {
+	id       uint32
+	username string
+	email    string
+}
+
 type Statement struct {
 	statementType StatementType
+	rowToInsert   Row
 }
 
 func main() {
@@ -49,14 +57,21 @@ func main() {
 			}
 		}
 
-		statement := &Statement{}
+		statement := &Statement{
+			rowToInsert: Row{},
+		}
 		switch prepareStatement(text, statement) {
 		case PrepareSuccess:
 			fmt.Println("statement prepared")
 		case PrepareUnrecognizedStatement:
 			fmt.Printf("Unrecognized keyword %s\n", text)
 			continue
+		case PrepareSyntaxError:
+			fmt.Printf("Syntax error %s\n", text)
+			continue
 		}
+
+		fmt.Printf("%+v\n", statement)
 
 		executeStatement(statement)
 		fmt.Println("Executed")
@@ -74,6 +89,13 @@ func doMetaCommand(command string) MetaCommandResult {
 func prepareStatement(command string, statement *Statement) PrepareResult {
 	if command[:6] == "insert" {
 		statement.statementType = StatementInsert
+		arg_count, err := fmt.Sscanf(command, "insert %d %s %s", &statement.rowToInsert.id, &statement.rowToInsert.username, &statement.rowToInsert.email)
+		if err != nil {
+			panic(err)
+		}
+		if arg_count < 3 {
+			return PrepareSyntaxError
+		}
 		return PrepareSuccess
 	}
 
