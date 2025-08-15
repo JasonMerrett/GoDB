@@ -1,117 +1,190 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 )
 
-type MetaCommandResult int
-
-const (
-	MetaCommandSuccess MetaCommandResult = iota
-	MetaCommandUnrecognizedCommand
-)
-
-type PrepareResult int
-
-const (
-	PrepareSuccess PrepareResult = iota
-	PrepareUnrecognizedStatement
-	PrepareSyntaxError
-)
-
-type StatementType int
-
-const (
-	StatementInsert StatementType = iota
-	StatementSelect
-)
-
-type Row struct {
-	id       uint32
-	username string
-	email    string
+type Node struct {
+	keys     [][]byte
+	vals     [][]byte
+	children []*Node
 }
 
-type Statement struct {
-	statementType StatementType
-	rowToInsert   Row
+const (
+	BNODE_NODE = 1
+	BNODE_LEAF = 2
+)
+
+const BTREE_PAGE_SIZE = 4096
+const BTREE_MAX_KEY_SIZE = 1000
+const BTREE_MAX_VAL_SIZE = 3000
+
+func init() {
+	node1max := 4 + 1*8 + 1*2 + 4 + BTREE_MAX_KEY_SIZE + BTREE_MAX_VAL_SIZE
+	if node1max > BTREE_PAGE_SIZE {
+		os.Exit(1)
+	}
 }
 
 func main() {
-	scanner := bufio.NewScanner(os.Stdin)
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+	new.setHeader(BNODE_LEAF, 2)
+	nodeAppendKV(new, 0, 0, []byte("k2"), []byte("b"))
+	nodeAppendKV(new, 1, 0, []byte("k3"), []byte("c"))
 
-	for {
-		fmt.Print("GoDB> ")
+	fmt.Printf("%s\n", new.getVal(0))
+}
 
-		scanner.Scan()
-		text := scanner.Text()
-		if text[0] == '.' {
-			switch doMetaCommand(text) {
-			case MetaCommandSuccess:
-				os.Exit(0)
-			case MetaCommandUnrecognizedCommand:
-				fmt.Printf("Unrecognized command %s\n", text)
-				continue
-			}
-		}
-
-		statement := &Statement{
-			rowToInsert: Row{},
-		}
-		switch prepareStatement(text, statement) {
-		case PrepareSuccess:
-			fmt.Println("statement prepared")
-		case PrepareUnrecognizedStatement:
-			fmt.Printf("Unrecognized keyword %s\n", text)
-			continue
-		case PrepareSyntaxError:
-			fmt.Printf("Syntax error %s\n", text)
-			continue
-		}
-
-		fmt.Printf("%+v\n", statement)
-
-		executeStatement(statement)
-		fmt.Println("Executed")
+func assert(condition bool) {
+	if !condition {
+		panic("Something went wrong")
 	}
 }
 
-func doMetaCommand(command string) MetaCommandResult {
-	if command == ".exit" {
-		return MetaCommandSuccess
-	} else {
-		return MetaCommandUnrecognizedCommand
+type BNode []byte
+
+func (node BNode) btype() uint16 {
+	return binary.LittleEndian.Uint16(node[0:2])
+}
+
+func (node BNode) nkeys() uint16 {
+	return binary.LittleEndian.Uint16(node[2:4])
+}
+
+func (node BNode) nbytes() uint16 {
+	return node.kvPos(node.nkeys())
+}
+
+func (node BNode) setHeader(btype, nkeys uint16) {
+	binary.LittleEndian.PutUint16(node[0:2], btype)
+	binary.LittleEndian.PutUint16(node[2:4], nkeys)
+}
+
+func (node BNode) getPtr(idx uint16) uint64 {
+	assert(idx <= node.nkeys())
+	pos := 4 + 8*idx
+	return binary.LittleEndian.Uint64(node[pos:])
+}
+
+func (node BNode) setPtr(idx uint16, val uint64) {
+	assert(idx <= node.nkeys())
+	pos := 4 + 8*idx
+	binary.LittleEndian.PutUint64(node[pos:], val)
+}
+
+func (node BNode) getOffset(idx uint16) uint16 {
+	if idx == 0 {
+		return 0
+	}
+	pos := 4 + 8*node.nkeys() + 2*(idx-1)
+	return binary.LittleEndian.Uint16(node[pos:])
+}
+
+func (node BNode) setOffset(idx, offset uint16) {
+	pos := 4 + 8*node.nkeys() + 2*(idx-1)
+	binary.LittleEndian.PutUint16(node[pos:], offset)
+}
+
+func (node BNode) kvPos(idx uint16) uint16 {
+	assert(idx <= node.nkeys())
+	return 4 + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
+}
+
+func (node BNode) getKey(idx uint16) []byte {
+	assert(idx <= node.nkeys())
+	pos := node.kvPos(idx)
+	klen := binary.LittleEndian.Uint16(node[pos:])
+	return node[pos+4:][:klen]
+}
+
+func (node BNode) getVal(idx uint16) []byte {
+	assert(idx <= node.nkeys())
+	pos := node.kvPos(idx)
+	klen := binary.LittleEndian.Uint16(node[pos+0:])
+	vlen := binary.LittleEndian.Uint16(node[pos+2:])
+	return node[pos+4+klen:][:vlen]
+}
+
+func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
+	new.setPtr(idx, ptr)
+
+	pos := new.kvPos(idx)
+	binary.LittleEndian.PutUint16(new[pos+0:], uint16(len(key)))
+	binary.LittleEndian.PutUint16(new[pos+2:], uint16(len(val)))
+
+	copy(new[pos+4:], key)
+	copy(new[pos+4+uint16(len(key)):], val)
+
+	new.setOffset(idx+1, new.getOffset(idx)+4+uint16(len(key)+len(val)))
+}
+
+func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+}
+
+func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys())
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx+1, old.nbytes()-(idx+1))
+}
+
+func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
+	for i := uint16(0); i < n; i++ {
+		dst, src := dstNew+i, srcOld+i
+		nodeAppendKV(new, dst, old.getPtr(src), old.getKey(src), old.getVal(src))
 	}
 }
 
-func prepareStatement(command string, statement *Statement) PrepareResult {
-	if command[:6] == "insert" {
-		statement.statementType = StatementInsert
-		arg_count, err := fmt.Sscanf(command, "insert %d %s %s", &statement.rowToInsert.id, &statement.rowToInsert.username, &statement.rowToInsert.email)
-		if err != nil {
-			panic(err)
+func nodeLookupLE(node BNode, key []byte) uint16 {
+	nkeys := node.nkeys()
+	var i uint16
+	for i = 0; i < nkeys; i++ {
+		cmp := bytes.Compare(node.getKey(i), key)
+		if cmp == 0 {
+			return i
 		}
-		if arg_count < 3 {
-			return PrepareSyntaxError
+		if cmp > 0 {
+			return i - 1
 		}
-		return PrepareSuccess
 	}
-
-	if command[:6] == "select" {
-		statement.statementType = StatementSelect
-		return PrepareSuccess
-	}
-
-	return PrepareUnrecognizedStatement
+	return i - 1
 }
 
-func executeStatement(statement *Statement) {
-	switch statement.statementType {
-	case StatementInsert:
-		fmt.Println("Do insert")
-	case StatementSelect:
-		fmt.Println("Do select")
+func nodeSplit2(left, right, old BNode) {
+	assert(old.nkeys() >= 2)
+
+	nleft := old.nkeys() / 2
+
+	left_bytes := func() uint16 {
+		return 4 + 8*nleft + 2*nleft + old.getOffset(nleft)
 	}
+	for left_bytes() > BTREE_PAGE_SIZE {
+		nleft--
+	}
+
+	assert(nleft >= 1)
+
+	right_bytes := func() uint16 {
+		return old.nbytes() - left_bytes() + 4
+	}
+	for right_bytes() > BTREE_PAGE_SIZE {
+		nleft++
+	}
+
+	assert(nleft < old.nkeys())
+	nright := old.nkeys() - nleft
+
+	left.setHeader(old.btype(), nleft)
+	right.setHeader(old.btype(), nright)
+	nodeAppendRange(left, old, 0, 0, nleft)
+	nodeAppendRange(right, old, 0, nleft, nright)
+
+	assert(right.nbytes() <= BTREE_PAGE_SIZE)
 }
