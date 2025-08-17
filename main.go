@@ -7,10 +7,11 @@ import (
 	"os"
 )
 
-type Node struct {
-	keys     [][]byte
-	vals     [][]byte
-	children []*Node
+type BTree struct {
+	root uint64
+	get  func(uint64) []byte
+	new  func([]byte) uint64
+	del  func(uint64)
 }
 
 const (
@@ -188,3 +189,96 @@ func nodeSplit2(left, right, old BNode) {
 
 	assert(right.nbytes() <= BTREE_PAGE_SIZE)
 }
+
+func nodeSplit3(old BNode) (uint16, [3]BNode) {
+	if old.nbytes() <= BTREE_PAGE_SIZE {
+		old = old[:BTREE_PAGE_SIZE]
+		return 1, [3]BNode{old}
+	}
+
+	left := BNode(make([]byte, 2*BTREE_PAGE_SIZE))
+	right := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplit2(left, right, old)
+
+	if left.nbytes() <= BTREE_PAGE_SIZE {
+		left = left[:BTREE_PAGE_SIZE]
+		return 2, [3]BNode{left, right}
+	}
+
+	leftleft := BNode(make([]byte, BTREE_PAGE_SIZE))
+	middle := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplit2(leftleft, middle, left)
+
+	assert(leftleft.nbytes() <= BTREE_PAGE_SIZE)
+
+	return 3, [3]BNode{leftleft, middle, right}
+}
+
+func nodeReplaceChildN(tree *BTree, new BNode, old BNode, idx uint16, children ...BNode) {
+	inc := uint16(len(children))
+	new.setHeader(BNODE_NODE, old.nkeys()+inc-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	for i, node := range children {
+		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
+	}
+	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
+}
+
+func treeInsert(tree *BTree, node BNode, key, val []byte) BNode {
+	new := BNode(make([]byte, 2*BTREE_PAGE_SIZE))
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if bytes.Equal(key, node.getKey(idx)) {
+			leafUpdate(new, node, idx, key, val)
+		} else {
+			leafInsert(new, node, idx+1, key, val)
+		}
+	case BNODE_NODE:
+		kptr := node.getPtr(idx)
+		knode := treeInsert(tree, tree.get(kptr), key, val)
+		nsplit, split := nodeSplit3(knode)
+		tree.del(kptr)
+		nodeReplaceChildN(tree, new, node, idx, split[:nsplit]...)
+	default:
+		panic("bad node")
+	}
+
+	return new
+}
+
+func (tree *BTree) Insert(key, val []byte) error {
+	assert(len(key) != 0)
+	assert(len(key) <= BTREE_MAX_KEY_SIZE)
+	assert(len(val) <= BTREE_MAX_VAL_SIZE)
+
+	if tree.root == 0 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_LEAF, 2)
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+		tree.root = tree.new(root)
+		return nil
+	}
+
+	node := treeInsert(tree, tree.get(tree.root), key, val)
+
+	nsplit, split := nodeSplit3(node)
+	tree.del(tree.root)
+
+	if nsplit > 1 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_NODE, nsplit)
+		for i, knode := range split[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+	} else {
+		tree.root = tree.new(split[0])
+	}
+
+	return nil
+}
+
+// TODO: Got to page 38
